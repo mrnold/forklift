@@ -16,6 +16,7 @@ import (
 
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/flashsystem"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/infinibox"
+	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/manual"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/ontap"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/populator"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/powerflex"
@@ -136,6 +137,12 @@ func main() {
 			storageHostname, storageUsername, storagePassword, storageSkipSSLVerification == "true")
 		if err != nil {
 			klog.Fatalf("failed to initialize Infinibox clonner with %s", err)
+		}
+		storageApi = &sm
+	case forklift.StorageVendorProductManual:
+		sm, err := manual.NewManualCloner(clientSet, targetNamespace)
+		if err != nil {
+			klog.Fatalf("failed to initialize manual cloner with %s", err)
 		}
 		storageApi = &sm
 	default:
