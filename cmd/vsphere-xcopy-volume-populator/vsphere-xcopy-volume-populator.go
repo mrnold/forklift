@@ -276,10 +276,16 @@ func getPv(kubeClient *kubernetes.Clientset, targetNamespace, targetPVC string) 
 	if err != nil {
 		return populator.PersistentVolume{}, fmt.Errorf("failed to fetch the target volume details %w", err)
 	}
+	handle := pv.Name
+	attributes := map[string]string{}
+	if pv.Spec.CSI != nil {
+		handle = pv.Spec.CSI.VolumeHandle
+		attributes = pv.Spec.CSI.VolumeAttributes
+	}
 	return populator.PersistentVolume{
 		Name:             pv.Name,
-		VolumeHandle:     pv.Spec.CSI.VolumeHandle,
-		VolumeAttributes: pv.Spec.CSI.VolumeAttributes}, nil
+		VolumeHandle:     handle,
+		VolumeAttributes: attributes}, nil
 }
 
 func handleArgs() {
