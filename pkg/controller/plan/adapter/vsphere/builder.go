@@ -2041,6 +2041,7 @@ func (r *Builder) ensurePopulatorServiceAccount(namespace string) error {
 				Resources: []string{"leases"},
 				Verbs:     []string{"get", "list", "watch", "create", "update", "patch"},
 			},
+			{
 				APIGroups: []string{""},
 				Resources: []string{"configmaps"},
 				Verbs:     []string{"get", "list"},
