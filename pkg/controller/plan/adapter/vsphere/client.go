@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	liburl "net/url"
+	"strings"
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
@@ -42,7 +43,9 @@ type Client struct {
 	hostClients map[string]*govmomi.Client
 }
 
-// Create a VM snapshot and return its ID.
+// Create a VM snapshot, and return either:
+// 1. the ID of a new or existing snapshot creation task in VMware, or
+// 2. the snapshot ID of an existing forklift snapshot
 func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapshotId string, creationTaskId string, err error) {
 	r.Log.V(1).Info("Creating snapshot", "vmRef", vmRef)
 	vm, err := r.getVM(vmRef, hostsFunc)
@@ -55,6 +58,17 @@ func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapsh
 		return "", existingTaskId, nil
 	}
 
+	// Avoid creating a new snapshot if one already exists
+	snapshotId, err = r.findExistingSnapshot(vmRef, hostsFunc)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	if snapshotId != "" {
+		r.Log.V(1).Info("Snapshot already exists", "vmRef", vmRef, "snapshotId", snapshotId)
+		return
+	}
+
 	task, err := vm.CreateSnapshot(context.TODO(), snapshotName, snapshotDesc, false, true)
 	if err != nil {
 		err = liberr.Wrap(err)
@@ -63,6 +77,27 @@ func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapsh
 
 	creationTaskId = task.Reference().Value
 	return "", creationTaskId, nil
+}
+
+// Check if there's already an existing Snapshot on this VM, to prevent duplicates
+// that might otherwise appear if there was a failure updating the migration plan.
+func (r *Client) findExistingSnapshot(vmRef ref.Ref, hosts util.HostsFunc) (string, error) {
+	vm, err := r.getVM(vmRef, hosts)
+	if err != nil {
+		return "", liberr.Wrap(err)
+	}
+	snapshot, err := vm.FindSnapshot(context.TODO(), snapshotName)
+	if err != nil {
+		if strings.Contains(err.Error(), "no snapshots for this VM") {
+			return "", nil
+		}
+		if strings.HasSuffix(err.Error(), "not found") {
+			return "", nil
+		}
+		return "", liberr.Wrap(err)
+	}
+
+	return snapshot.Value, nil
 }
 
 // Check if there's already a running CreateSnapshot task on the VM to prevent duplicates
@@ -326,6 +361,15 @@ func (r *Client) CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hos
 // Check if a snapshot is ready to transfer.
 func (r *Client) CheckSnapshotReady(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (ready bool, snapshotId string, err error) {
 	r.Log.Info("Check Snapshot Ready", "vmRef", vmRef, "precopy", precopy)
+
+	snapshotId, err = r.findExistingSnapshot(vmRef, hosts)
+	if err != nil {
+		return false, "", liberr.Wrap(err)
+	}
+	if snapshotId != "" {
+		return true, snapshotId, nil
+	}
+
 	taskInfo, err := r.getTaskById(vmRef, precopy.CreateTaskId, hosts)
 	if err != nil {
 		return false, "", liberr.Wrap(err)
