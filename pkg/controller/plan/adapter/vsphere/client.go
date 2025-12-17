@@ -159,7 +159,7 @@ func (r *Client) RemoveSnapshot(vmRef ref.Ref, snapshot string, hosts util.Hosts
 		"snapshot", snapshot,
 		"children", false)
 
-	task, err := vm.RemoveSnapshot(context.TODO(), snapshot, false, nil)
+	task, err := vm.RemoveSnapshot(context.TODO(), snapshot, false, ptr.To(false))
 	if err != nil {
 		return "", liberr.Wrap(err)
 	}
