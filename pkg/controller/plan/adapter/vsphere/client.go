@@ -353,9 +353,31 @@ func (r *Client) CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hos
 	r.Log.Info("Check Snapshot Remove", "vmRef", vmRef, "precopy", precopy)
 	taskInfo, err := r.getTaskById(vmRef, precopy.RemoveTaskId, hosts)
 	if err != nil {
+		if !strings.Contains(err.Error(), "has already been deleted") {
+			return false, liberr.Wrap(err)
+		}
+	} else {
+		taskStatus, err := r.checkTaskStatus(taskInfo)
+		if err != nil {
+			return false, liberr.Wrap(err)
+		}
+		if !taskStatus {
+			r.Log.Info("Waiting for snapshot removal task to complete", "vmRef", vmRef, "taskId", precopy.RemoveTaskId)
+			return false, nil
+		}
+	}
+
+	// Task is done, make sure snapshot is gone
+	snapshotId, err := r.findExistingSnapshot(vmRef, hosts)
+	if err != nil {
 		return false, liberr.Wrap(err)
 	}
-	return r.checkTaskStatus(taskInfo)
+	if snapshotId != "" {
+		r.Log.Info("Waiting for complete snapshot removal", "vmRef", vmRef, "snapshotId", snapshotId)
+		return false, nil
+	}
+
+	return true, nil
 }
 
 // Check if a snapshot is ready to transfer.
