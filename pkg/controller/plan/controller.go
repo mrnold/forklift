@@ -283,9 +283,14 @@ func (r *Reconciler) updatePlanStatus(plan *api.Plan) error {
 	// and the staged flags in the status, and more data that has been loaded in the validate function,
 	// like the name of the VMs in the spec section, therefore we don't want the plan to be overridden
 	// by data from the server (even the spec section is overridden) and so we pass a copy of the plan
-	if err := r.Status().Update(context.TODO(), plan.DeepCopy()); err != nil {
-		r.Log.Error(err, "Failed to update plan status", "plan", plan)
-		return err
+	planCopy := plan.DeepCopy()
+	if err := r.Status().Update(context.TODO(), planCopy); err != nil {
+		r.Log.Error(err, "Failed to update plan status, attempting patch...", "plan", plan)
+		patch := client.MergeFrom(planCopy)
+		if err := r.Client.Patch(context.TODO(), plan, patch); err != nil {
+			r.Log.Error(err, "Failed to patch plan status", "plan", plan.Name)
+			return err
+		}
 	}
 
 	return nil
