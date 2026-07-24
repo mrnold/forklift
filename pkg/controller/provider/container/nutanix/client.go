@@ -1,21 +1,15 @@
 package nutanix
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"fmt"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/kubev2v/forklift/pkg/controller/base"
+	nutanixweb "github.com/kubev2v/forklift/pkg/lib/client/nutanix"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libweb "github.com/kubev2v/forklift/pkg/lib/inventory/web"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
-	"github.com/kubev2v/forklift/pkg/lib/util"
 	core "k8s.io/api/core/v1"
 )
 
@@ -24,7 +18,7 @@ const (
 	// Connect retry delay.
 	RetryDelay = time.Second * 5
 	// Connection timeout.
-	ConnectionTimeout = 30 * time.Second
+	ConnectionTimeout = nutanixweb.ConnectionTimeout
 )
 
 // Per-request page sizes for v3 list endpoints. listAll() pages through as
@@ -43,12 +37,15 @@ const (
 	imageV4PageSize            = 100
 )
 
-// Nutanix API Client
+// Client wraps the shared pkg/lib/client/nutanix REST client with the
+// collector-specific concerns: Prism mode resolution/caching and the
+// cluster-scoped, entity-specific list methods used by the collector.
+// The generic HTTP/auth/pagination plumbing lives in the shared client so
+// the migration plan adapter (pkg/controller/plan/adapter/nutanix) can
+// reuse it without depending on this package.
 type Client struct {
 	// Base URL (e.g., https://prism-central:9440)
 	url string
-	// HTTP client
-	client *libweb.Client
 	// Secret containing credentials
 	secret *core.Secret
 	// Provider settings (prismType, clusterUuid, ...)
@@ -61,68 +58,39 @@ type Client struct {
 	prism PrismConfig
 	// Whether prism config has been resolved.
 	prismResolved bool
+
+	// Shared REST client (connect/auth/get/post/pagination).
+	web nutanixweb.Client
 }
 
-// Connect and authenticate with Nutanix Prism
-func (r *Client) connect() (status int, err error) {
-	var TLSClientConfig *tls.Config
-
-	if r.client != nil {
-		return http.StatusOK, nil
-	}
-
-	// Configure TLS
-	if base.GetInsecureSkipVerifyFlag(r.secret) {
-		TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	} else if cacert, found := util.GetCACert(r.secret); found {
-		roots := x509.NewCertPool()
-		ok := roots.AppendCertsFromPEM(cacert)
-		if !ok {
-			err = liberr.New("failed to parse CA certificate")
-			return http.StatusBadRequest, err
+// ensureWebClient populates the shared REST client from this client's
+// fields the first time it's needed. It never resets an already-populated
+// r.web, so a live connection (and its TLS-configured transport) survives
+// repeated calls.
+func (r *Client) ensureWebClient() {
+	if r.web.URL == "" {
+		r.web = nutanixweb.Client{
+			URL:     r.url,
+			Secret:  r.secret,
+			Timeout: r.clientTimeout,
+			Log:     r.log,
 		}
-		TLSClientConfig = &tls.Config{RootCAs: roots}
-	} else {
-		TLSClientConfig = &tls.Config{InsecureSkipVerify: false}
 	}
+}
 
-	r.url = strings.TrimRight(r.url, "/")
+// Connect and authenticate with Nutanix Prism, then resolve the Prism
+// mode (Central vs Element) for this provider.
+func (r *Client) connect() (status int, err error) {
+	r.ensureWebClient()
 
-	// Bound how long we wait for a response once a request has been sent, so
-	// a hung Prism endpoint can't block a request indefinitely. libweb.Client
-	// builds its http.Client without a Timeout, so this is enforced via the
-	// transport's ResponseHeaderTimeout instead.
-	responseHeaderTimeout := r.clientTimeout
-	if responseHeaderTimeout <= 0 {
-		responseHeaderTimeout = ConnectionTimeout
-	}
-
-	// Create HTTP client
-	r.client = &libweb.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 10 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       10 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			ResponseHeaderTimeout: responseHeaderTimeout,
-			TLSClientConfig:       TLSClientConfig,
-		},
-	}
-
-	// Test connection by listing clusters
-	status, err = r.testConnection()
+	status, err = r.web.Connect()
 	if err != nil {
-		r.client = nil
-		return status, err
+		return
 	}
+	// Pick up the trimmed (no trailing slash) URL.
+	r.url = r.web.URL
 
 	if err = r.ensurePrismConfig(); err != nil {
-		r.client = nil
 		return status, err
 	}
 
@@ -130,30 +98,7 @@ func (r *Client) connect() (status int, err error) {
 		"url", r.url,
 		"prismMode", r.prism.Mode)
 
-	return http.StatusOK, nil
-}
-
-// Test connection to Nutanix API
-func (r *Client) testConnection() (status int, err error) {
-	// Test by listing clusters (minimal API call)
-	url := fmt.Sprintf("%s/api/nutanix/v3/clusters/list", r.url)
-
-	// Create a simple list request
-	body := map[string]interface{}{
-		"kind":   "cluster",
-		"offset": 0,
-		"length": 1,
-	}
-
-	status, err = r.post(url, body, nil)
-	if err != nil {
-		return status, liberr.Wrap(err, "connection test failed")
-	}
-	if status != http.StatusOK {
-		return status, liberr.New("connection test failed", "status", status)
-	}
-
-	return http.StatusOK, nil
+	return status, nil
 }
 
 // GET request
@@ -162,16 +107,7 @@ func (r *Client) get(url string, object interface{}, params ...libweb.Param) (st
 	if err != nil {
 		return
 	}
-
-	// Set Basic Auth header
-	r.client.Header = r.createAuthHeader()
-
-	status, err = r.client.Get(url, object, params...)
-	if err != nil {
-		return
-	}
-
-	return
+	return r.web.Get(url, object, params...)
 }
 
 // POST request (Nutanix uses POST for list operations)
@@ -180,12 +116,7 @@ func (r *Client) post(url string, body interface{}, object interface{}) (status 
 	if err != nil {
 		return
 	}
-
-	// Set Basic Auth header
-	r.client.Header = r.createAuthHeader()
-
-	// Use the client's Post method
-	return r.client.Post(url, body, object)
+	return r.web.Post(url, body, object)
 }
 
 // listAllV3 pages through a v3 list endpoint and unmarshals entities directly
@@ -276,24 +207,6 @@ func listAllV4[T any](r *Client, path string, pageSize int) ([]T, error) {
 	}
 
 	return entities, nil
-}
-
-// Create HTTP Header with Basic Auth
-func (r *Client) createAuthHeader() http.Header {
-	user := string(r.secret.Data["user"])
-	password := string(r.secret.Data["password"])
-
-	header := http.Header{}
-	header.Set("Content-Type", "application/json")
-	header.Set("Authorization", "Basic "+basicAuth(user, password))
-
-	return header
-}
-
-// Encode Basic Auth credentials
-func basicAuth(username, password string) string {
-	auth := username + ":" + password
-	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
 // List all clusters, scoped to the configured clusterUuid (if any).
