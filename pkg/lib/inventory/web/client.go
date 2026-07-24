@@ -232,6 +232,100 @@ func (r *Client) Post(url string, in interface{}, out interface{}) (status int, 
 	return
 }
 
+/*
+HTTP PUT (method).
+When the `in interface{}` is a string, it is passed as raw bytes otherwise it uses the json.Marshal on it.
+*/
+func (r *Client) Put(url string, in interface{}, out interface{}) (status int, err error) {
+	return r.send(http.MethodPut, url, in, out)
+}
+
+// HTTP DELETE (method). The response body, if any, is decoded into `out`
+// when non-nil (some APIs return an async task reference on delete).
+func (r *Client) Delete(url string, out interface{}) (status int, err error) {
+	return r.send(http.MethodDelete, url, nil, out)
+}
+
+// send issues an HTTP request with an optional JSON (or raw string) body,
+// and optionally decodes a JSON response into `out`. Shared by Put and
+// Delete; Get and Post have their own long-established implementations and
+// are left as-is to avoid changing existing behavior.
+func (r *Client) send(method string, url string, in interface{}, out interface{}) (status int, err error) {
+	parsedURL, err := liburl.Parse(url)
+	if err != nil {
+		err = liberr.Wrap(
+			err,
+			"URL not valid.",
+			"url",
+			url)
+		return
+	}
+	var body io.ReadCloser
+	if in != nil {
+		var reader *bytes.Reader
+		switch v := in.(type) {
+		case string:
+			reader = bytes.NewReader([]byte(v))
+		default:
+			var marshaled []byte
+			marshaled, err = json.Marshal(in)
+			if err != nil {
+				err = liberr.Wrap(
+					err,
+					"json marshal failed.",
+					"url",
+					url)
+				return
+			}
+			reader = bytes.NewReader(marshaled)
+		}
+		body = io.NopCloser(reader)
+	}
+	request := &http.Request{
+		Header: r.Header,
+		Method: method,
+		Body:   body,
+		URL:    parsedURL,
+	}
+	client := http.Client{Transport: r.Transport}
+	response, err := client.Do(request)
+	if err != nil {
+		err = liberr.Wrap(
+			err,
+			method+" failed.",
+			"url",
+			url)
+		return
+	}
+	r.Reply.Header = response.Header
+	defer func() {
+		_ = response.Body.Close()
+	}()
+	content, err := io.ReadAll(response.Body)
+	if err != nil {
+		err = liberr.Wrap(
+			err,
+			"Read body failed.",
+			"url",
+			url)
+		return
+	}
+	status = response.StatusCode
+	if status >= http.StatusOK && status < http.StatusMultipleChoices && out != nil && len(content) > 0 {
+		err = json.Unmarshal(content, out)
+		if err != nil {
+			err = liberr.Wrap(
+				err,
+				"json unmarshal failed.",
+				"url",
+				url)
+			return
+		}
+	}
+
+	return
+}
+
 // Watch a resource.
 func (r *Client) Watch(url string, resource interface{}, h EventHandler) (status int, w *Watch, err error) {
 	url = r.patchURL(url)
