@@ -328,16 +328,17 @@ func newImageTestServer(t *testing.T, images map[string]map[string]interface{}) 
 	}))
 }
 
-// newPrismCentralTestServer serves the connectivity probe plus a 200 OK
-// on Prism Central's self-describing endpoint, simulating a Prism Central
-// connection. It doesn't implement the v3 image endpoints used by the
-// catalog-image workflow, since requireElement is expected to reject
-// Prism Central before any of those are reached; imageListRequests counts
-// requests to the image list endpoint so tests can confirm that.
-func newPrismCentralTestServer(t *testing.T) (server *httptest.Server, imageListRequests *int) {
+// newPrismCentralTestServer serves the connectivity probe, a 200 OK on
+// Prism Central's self-describing endpoint, and a minimal v4 image
+// list/create/delete implementation backed by an in-memory store keyed
+// by extId, for testing the Prism Central catalog image lifecycle used
+// by PreTransferActions/Finalize. A created image has no sizeBytes until
+// a test explicitly sets one (via the images map), mirroring Prism
+// Central not populating it until the image finishes uploading.
+func newPrismCentralTestServer(t *testing.T, images map[string]map[string]interface{}) *httptest.Server {
 	t.Helper()
-	var requests int
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	nextID := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/clusters/list"):
 			w.WriteHeader(http.StatusOK)
@@ -345,14 +346,32 @@ func newPrismCentralTestServer(t *testing.T) (server *httptest.Server, imageList
 		case r.Method == http.MethodGet && r.URL.Path == prismCentralPath:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
-		case strings.HasSuffix(r.URL.Path, "/images/list"):
-			requests++
-			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Path == imagesV4Path:
+			filter := r.URL.Query().Get("$filter")
+			entities := make([]map[string]interface{}, 0, len(images))
+			for _, e := range images {
+				if filter == "" || filter == fmt.Sprintf("name eq '%s'", e["name"]) {
+					entities = append(entities, e)
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": entities})
+		case r.Method == http.MethodPost && r.URL.Path == imagesV4Path:
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			nextID++
+			extID := fmt.Sprintf("image-%d", nextID)
+			images[extID] = map[string]interface{}{"extId": extID, "name": body["name"]}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, imagesV4Path+"/"):
+			delete(images, path.Base(r.URL.Path))
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{}`))
 		default:
-			w.WriteHeader(http.StatusNotFound)
+			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
-	return server, &requests
 }
 
 // TestIsPrismElement_DetectsElementViaProbe verifies isPrismElement
@@ -375,7 +394,7 @@ func TestIsPrismElement_DetectsElementViaProbe(t *testing.T) {
 // TestIsPrismElement_DetectsCentralViaProbe verifies isPrismElement
 // treats a 200 response from prismCentralPath as Prism Central.
 func TestIsPrismElement_DetectsCentralViaProbe(t *testing.T) {
-	server, _ := newPrismCentralTestServer(t)
+	server := newPrismCentralTestServer(t, map[string]map[string]interface{}{})
 	defer server.Close()
 
 	client := newConnectedTestClient(t, server.URL)
@@ -406,12 +425,20 @@ func TestIsPrismElement_HonorsExplicitProviderSetting(t *testing.T) {
 	}
 }
 
-// TestPreTransferActions_ErrorsOnPrismCentral verifies the catalog-image
-// workflow refuses to run against Prism Central, rather than attempting
-// image creation and failing later with a confusing API error.
-func TestPreTransferActions_ErrorsOnPrismCentral(t *testing.T) {
-	vm := &model.VM{VM1: model.VM1{Disks: []model.Disk{{UUID: "disk-1"}}}}
-	server, imageListRequests := newPrismCentralTestServer(t)
+// TestPreTransferActions_CreatesV4ImagesForPrismCentral mirrors
+// TestPreTransferActions_CreatesImagesAndWaitsForComplete for Prism
+// Central's v4 Image Service: creates one image per non-CDROM disk,
+// reports not ready while sizeBytes is still unset, and reports ready
+// once it's populated.
+func TestPreTransferActions_CreatesV4ImagesForPrismCentral(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1", DiskSizeBytes: 1024},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]map[string]interface{}{}
+	server := newPrismCentralTestServer(t, images)
 	defer server.Close()
 
 	client := newTestClientWithInventory(server.URL, vm)
@@ -419,30 +446,75 @@ func TestPreTransferActions_ErrorsOnPrismCentral(t *testing.T) {
 		t.Fatalf("unexpected error connecting: %v", err)
 	}
 
-	ready, err := client.PreTransferActions(ref.Ref{ID: "vm-1"})
-	if err == nil {
-		t.Fatal("expected an error when running the catalog-image workflow against Prism Central")
+	vmRef := ref.Ref{ID: "vm-1"}
+	ready, err := client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if ready {
-		t.Fatal("expected ready=false")
+		t.Fatal("expected ready=false on first call, before the image exists")
 	}
-	if *imageListRequests != 0 {
-		t.Fatalf("expected no image lookups against Prism Central, got %d", *imageListRequests)
+	if len(images) != 1 {
+		t.Fatalf("expected exactly one image to be created (CDROM should be skipped), got %d", len(images))
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready {
+		t.Fatal("expected ready=false while sizeBytes is still unset")
+	}
+
+	for _, entity := range images {
+		entity["sizeBytes"] = float64(1024)
+	}
+
+	ready, err = client.PreTransferActions(vmRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected ready=true once sizeBytes is populated")
 	}
 }
 
-// TestFinalize_SkipsCleanupOnPrismCentral verifies Finalize doesn't
-// attempt any image lookups against Prism Central, since
-// PreTransferActions never creates images there.
-func TestFinalize_SkipsCleanupOnPrismCentral(t *testing.T) {
-	server, imageListRequests := newPrismCentralTestServer(t)
+// TestFinalize_DeletesV4ImagesForPrismCentral mirrors
+// TestFinalize_DeletesImages for Prism Central's v4 Image Service.
+func TestFinalize_DeletesV4ImagesForPrismCentral(t *testing.T) {
+	vm := &model.VM{VM1: model.VM1{
+		Disks: []model.Disk{
+			{UUID: "disk-1"},
+			{UUID: "cdrom-1", IsCdrom: true},
+		},
+	}}
+	images := map[string]map[string]interface{}{
+		"image-1": {
+			"extId":     "image-1",
+			"name":      migrationImageName(ref.Ref{ID: "vm-1"}, "disk-1"),
+			"sizeBytes": float64(1024),
+		},
+		"image-unrelated": {
+			"extId":     "image-unrelated",
+			"name":      "unrelated-image",
+			"sizeBytes": float64(1024),
+		},
+	}
+	server := newPrismCentralTestServer(t, images)
 	defer server.Close()
 
-	client := newConnectedTestClient(t, server.URL)
+	client := newTestClientWithInventory(server.URL, vm)
+	if err := client.connect(); err != nil {
+		t.Fatalf("unexpected error connecting: %v", err)
+	}
+
 	client.Finalize([]*planapi.VMStatus{{VM: planapi.VM{Ref: ref.Ref{ID: "vm-1"}}}}, "test-plan")
 
-	if *imageListRequests != 0 {
-		t.Fatalf("expected Finalize to skip image lookups for Prism Central, got %d", *imageListRequests)
+	if _, found := images["image-1"]; found {
+		t.Fatal("expected the VM's catalog image to be deleted")
+	}
+	if _, found := images["image-unrelated"]; !found {
+		t.Fatal("expected an unrelated image to be left alone")
 	}
 }
 

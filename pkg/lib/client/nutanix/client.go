@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/kubev2v/forklift/pkg/controller/base"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
 	libweb "github.com/kubev2v/forklift/pkg/lib/inventory/web"
@@ -140,14 +141,51 @@ func (r *Client) Get(url string, object interface{}, params ...libweb.Param) (st
 	return r.client.Get(url, object, params...)
 }
 
+// GetNoRedirect issues an authenticated GET without following redirects,
+// returning the raw response status and headers instead of decoding a
+// body. This exists for endpoints that hand back a redirect carrying
+// caller-specific instructions in its headers (e.g. a token that must be
+// replayed as a cookie on the next request) -- something a normal
+// redirect-following client can't act on, since it never gets to see
+// that intermediate response.
+func (r *Client) GetNoRedirect(url string) (status int, header http.Header, err error) {
+	status, err = r.Connect()
+	if err != nil {
+		return
+	}
+
+	request, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, nil, liberr.Wrap(err, "failed to build request", "url", url)
+	}
+	request.Header = r.createAuthHeader()
+
+	client := http.Client{
+		Transport: r.client.Transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, liberr.Wrap(err, "request failed", "url", url)
+	}
+	defer func() {
+		_ = response.Body.Close()
+	}()
+
+	return response.StatusCode, response.Header, nil
+}
+
 // Post issues an authenticated POST request. Nutanix v3 uses POST for list
-// operations as well as creation.
+// operations as well as creation. Mutating v4 endpoints require a unique
+// NTNX-Request-Id; it is harmless on v3, so every Post carries one.
 func (r *Client) Post(url string, body interface{}, object interface{}) (status int, err error) {
 	status, err = r.Connect()
 	if err != nil {
 		return
 	}
-	r.client.Header = r.createAuthHeader()
+	r.client.Header = r.createMutatingHeader()
 	return r.client.Post(url, body, object)
 }
 
@@ -158,7 +196,7 @@ func (r *Client) Put(url string, body interface{}, object interface{}) (status i
 	if err != nil {
 		return
 	}
-	r.client.Header = r.createAuthHeader()
+	r.client.Header = r.createMutatingHeader()
 	return r.client.Put(url, body, object)
 }
 
@@ -170,7 +208,7 @@ func (r *Client) Delete(url string, object interface{}) (status int, err error) 
 	if err != nil {
 		return
 	}
-	r.client.Header = r.createAuthHeader()
+	r.client.Header = r.createMutatingHeader()
 	return r.client.Delete(url, object)
 }
 
@@ -296,6 +334,15 @@ func (r *Client) createAuthHeader() http.Header {
 	header.Set("Content-Type", "application/json")
 	header.Set("Authorization", "Basic "+basicAuth(user, password))
 
+	return header
+}
+
+// createMutatingHeader is createAuthHeader plus a fresh NTNX-Request-Id.
+// Prism Central's v4 mutating APIs reject requests that omit it
+// ("Failed to perform the operation as the request ID is missing.").
+func (r *Client) createMutatingHeader() http.Header {
+	header := r.createAuthHeader()
+	header.Set("NTNX-Request-Id", uuid.NewString())
 	return header
 }
 

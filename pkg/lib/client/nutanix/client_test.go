@@ -84,7 +84,15 @@ func TestConnectFailure(t *testing.T) {
 // TestGetPost verifies Get and Post issue authenticated requests and decode
 // JSON responses.
 func TestGetPost(t *testing.T) {
+	var sawRequestID bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if id := r.Header.Get("NTNX-Request-Id"); id == "" {
+				t.Errorf("POST missing NTNX-Request-Id")
+			} else {
+				sawRequestID = true
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		switch r.Method {
@@ -112,6 +120,48 @@ func TestGetPost(t *testing.T) {
 	}
 	if postResult["method"] != "post" {
 		t.Fatalf("unexpected Post result: %v", postResult)
+	}
+	if !sawRequestID {
+		t.Fatal("expected Post to send NTNX-Request-Id")
+	}
+}
+
+// TestGetNoRedirect verifies GetNoRedirect returns a redirect response's
+// status and headers as-is, rather than transparently following it like
+// Get does -- needed for APIs (e.g. Nutanix's v4 image download) that put
+// caller-specific instructions in a redirect's headers that a normal
+// redirect-following client would never see.
+func TestGetNoRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/nutanix/v3/clusters/list" {
+			// Connectivity probe issued by the first call to Connect().
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+			return
+		}
+		if r.URL.Path == "/redirect" {
+			w.Header().Set("Location", "http://example.invalid/final")
+			w.Header().Set("X-Redirect-Token", "some-token")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		t.Fatalf("expected the redirect not to be followed, got a request for %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	status, header, err := client.GetNoRedirect(server.URL + "/redirect")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusFound {
+		t.Fatalf("expected status %d, got %d", http.StatusFound, status)
+	}
+	if header.Get("Location") != "http://example.invalid/final" {
+		t.Fatalf("unexpected Location header: %v", header.Get("Location"))
+	}
+	if header.Get("X-Redirect-Token") != "some-token" {
+		t.Fatalf("unexpected X-Redirect-Token header: %v", header.Get("X-Redirect-Token"))
 	}
 }
 
