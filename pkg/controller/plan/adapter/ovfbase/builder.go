@@ -21,6 +21,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/settings"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 	cnv "kubevirt.io/api/core/v1"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 )
@@ -210,6 +211,8 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 	}
 	r.mapDisks(vm, persistentVolumeClaims, object)
 	r.mapFirmware(vm, vmRef, object)
+	r.mapTpm(vm, object)
+	r.mapMachine(vm, object)
 	r.mapInput(object)
 	if !usesInstanceType {
 		r.mapCPU(vmRef, vm, object)
@@ -304,11 +307,22 @@ func (r *Builder) mapCPU(vmRef ref.Ref, vm *model.VM, object *cnv.VirtualMachine
 		vm.CoresPerSocket = 1
 	}
 
-	object.Template.Spec.Domain.CPU = &cnv.CPU{
-		Sockets: uint32(vm.CpuCount / vm.CoresPerSocket),
-		Cores:   uint32(vm.CoresPerSocket),
+	sockets := uint32(vm.CpuCount / vm.CoresPerSocket)
+	if vm.NumSockets > 0 {
+		sockets = uint32(vm.NumSockets)
 	}
-	if enableNestedVirt := r.NestedVirtualizationSetting(vmRef, false); enableNestedVirt != nil {
+	threads := uint32(1)
+	if vm.ThreadsPerCore > 0 {
+		threads = uint32(vm.ThreadsPerCore)
+	}
+
+	object.Template.Spec.Domain.CPU = &cnv.CPU{
+		Sockets: sockets,
+		Cores:   uint32(vm.CoresPerSocket),
+		Threads: threads,
+	}
+	nestedDefault := vm.NestedVirtualization
+	if enableNestedVirt := r.NestedVirtualizationSetting(vmRef, nestedDefault); enableNestedVirt != nil {
 		policy := "optional"
 		if !*enableNestedVirt {
 			policy = "disable"
@@ -318,6 +332,21 @@ func (r *Builder) mapCPU(vmRef ref.Ref, vm *model.VM, object *cnv.VirtualMachine
 			cnv.CPUFeature{Name: "svm", Policy: policy},
 		)
 	}
+}
+
+func (r *Builder) mapTpm(vm *model.VM, object *cnv.VirtualMachineSpec) {
+	if vm.TpmEnabled {
+		object.Template.Spec.Domain.Devices.TPM = &cnv.TPMDevice{Persistent: ptr.To(true)}
+		return
+	}
+	object.Template.Spec.Domain.Devices.TPM = &cnv.TPMDevice{Enabled: ptr.To(false)}
+}
+
+func (r *Builder) mapMachine(vm *model.VM, object *cnv.VirtualMachineSpec) {
+	if vm.MachineType == "" {
+		return
+	}
+	object.Template.Spec.Domain.Machine = &cnv.Machine{Type: vm.MachineType}
 }
 
 func (r *Builder) mapFirmware(vm *model.VM, vmRef ref.Ref, object *cnv.VirtualMachineSpec) {
