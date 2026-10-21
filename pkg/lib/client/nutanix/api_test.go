@@ -9,6 +9,16 @@ func TestV3ImageNameFilter(t *testing.T) {
 	}
 }
 
+func TestV3ImageNamePrefixFilter(t *testing.T) {
+	prefix := "forklift-migration-abc-vm-1-"
+	if filter := V3ImageNamePrefixFilter(prefix); filter != "name=="+prefix+".*" {
+		t.Fatalf("expected unquoted prefix regex wildcard, got %q", filter)
+	}
+	if filter := V3ImageNamePrefixFilter("name with spaces"); filter != "name=='name with spaces'.*" {
+		t.Fatalf("expected quoted prefix with trailing regex wildcard, got %q", filter)
+	}
+}
+
 func TestEscapeFIQLLiteral(t *testing.T) {
 	if got := escapeFIQLLiteral("name with spaces"); got != "'name with spaces'" {
 		t.Fatalf("expected quoted literal, got %q", got)

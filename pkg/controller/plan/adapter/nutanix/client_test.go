@@ -517,7 +517,14 @@ func newImageTestServer(t *testing.T, images map[string]libclient.V3Image) *http
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			entities := make([]libclient.V3Image, 0, len(images))
 			for _, image := range images {
-				if body.Filter == "" || body.Filter == libclient.V3ImageNameFilter(image.Spec.Name) {
+				name := image.Spec.Name
+				exact := body.Filter == "" || body.Filter == libclient.V3ImageNameFilter(name)
+				prefixMatch := false
+				if strings.HasPrefix(body.Filter, "name==") && strings.HasSuffix(body.Filter, ".*") {
+					prefix := strings.TrimSuffix(strings.TrimPrefix(body.Filter, "name=="), ".*")
+					prefixMatch = strings.HasPrefix(name, prefix)
+				}
+				if exact || prefixMatch {
 					entities = append(entities, image)
 				}
 			}
@@ -568,7 +575,12 @@ func newPrismCentralTestServer(t *testing.T, images map[string]libclient.ImageV4
 			filter := r.URL.Query().Get("$filter")
 			entities := make([]libclient.ImageV4, 0, len(images))
 			for _, image := range images {
-				if filter == "" || filter == fmt.Sprintf("name eq '%s'", image.Name) {
+				exact := filter == "" || filter == fmt.Sprintf("name eq '%s'", strings.ReplaceAll(image.Name, "'", "''"))
+				prefix := ""
+				if strings.HasPrefix(filter, "startswith(name, '") && strings.HasSuffix(filter, "')") {
+					prefix = strings.ReplaceAll(strings.TrimSuffix(strings.TrimPrefix(filter, "startswith(name, '"), "')"), "''", "'")
+				}
+				if exact || (prefix != "" && strings.HasPrefix(image.Name, prefix)) {
 					entities = append(entities, image)
 				}
 			}

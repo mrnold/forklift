@@ -40,7 +40,10 @@ const redirectTokenMaxLen = 4096
 func (r *Client) findImageV4ByName(name string) (entity *libclient.ImageV4, ready bool, err error) {
 	requestURL := fmt.Sprintf("%s%s", r.URL, imagesV4Path)
 	var result libclient.V4ListResponse[libclient.ImageV4]
-	status, err := r.Get(requestURL, &result, libweb.Param{Key: "$filter", Value: fmt.Sprintf("name eq '%s'", name)})
+	status, err := r.Get(requestURL, &result, libweb.Param{
+		Key:   "$filter",
+		Value: fmt.Sprintf("name eq '%s'", strings.ReplaceAll(name, "'", "''")),
+	})
 	if err != nil {
 		return nil, false, liberr.Wrap(err, "image", name)
 	}
@@ -56,6 +59,33 @@ func (r *Client) findImageV4ByName(name string) (entity *libclient.ImageV4, read
 		}
 	}
 	return nil, false, nil
+}
+
+// listImagesV4ByNamePrefix returns v4 images whose name starts with
+// prefix, keyed by name. Uses one filtered list call.
+func (r *Client) listImagesV4ByNamePrefix(prefix string) (map[string]libclient.ImageV4, error) {
+	requestURL := fmt.Sprintf("%s%s", r.URL, imagesV4Path)
+	var result libclient.V4ListResponse[libclient.ImageV4]
+	status, err := r.Get(requestURL, &result,
+		libweb.Param{
+			Key:   "$filter",
+			Value: fmt.Sprintf("startswith(name, '%s')", strings.ReplaceAll(prefix, "'", "''")),
+		},
+		libweb.Param{Key: "$limit", Value: fmt.Sprintf("%d", imagePageSize)},
+	)
+	if err != nil {
+		return nil, liberr.Wrap(err, "prefix", prefix)
+	}
+	if status != http.StatusOK {
+		return nil, liberr.New("unexpected status listing images", "prefix", prefix, "status", status)
+	}
+	out := make(map[string]libclient.ImageV4, len(result.Data))
+	for _, candidate := range result.Data {
+		if strings.HasPrefix(candidate.Name, prefix) {
+			out[candidate.Name] = candidate
+		}
+	}
+	return out, nil
 }
 
 // createImageV4 submits a v4 image creation request for a DISK_IMAGE
@@ -106,16 +136,14 @@ func (r *Client) deleteImageV4(vmRef ref.Ref, diskUUID string) {
 // ensureImage's create-if-missing/poll-by-name pattern, adapted to the v4
 // Image entity's lack of an explicit error state. A stalled image (sizeBytes
 // still zero after imageV4StallTimeout) is treated as a creation failure.
-func (r *Client) ensureImageV4(vmRef ref.Ref, disk model.Disk) (ready bool, err error) {
+// byName is the per-reconcile prefix list from PreTransferActions.
+func (r *Client) ensureImageV4(vmRef ref.Ref, disk model.Disk, byName map[string]libclient.ImageV4) (ready bool, err error) {
 	name := r.migrationImageName(vmRef, disk.UUID)
-	entity, ready, err := r.findImageV4ByName(name)
-	if err != nil {
-		return false, err
-	}
-	if entity == nil {
+	entity, ok := byName[name]
+	if !ok {
 		return false, r.createImageV4(name, disk.UUID)
 	}
-	if ready {
+	if entity.SizeBytes > 0 {
 		return true, nil
 	}
 	if entity.CreateTime != "" {

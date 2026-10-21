@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
@@ -329,6 +330,8 @@ func (r *Client) GetSnapshotDeltas(_ ref.Ref, _ string, _ util.HostsFunc) (s map
 // Prism Element uses the v3 Image Service (GET /images/{uuid}/file);
 // Prism Central uses the v4 Image Service instead, since v3 image
 // creation/listing isn't reliably populated when queried through it.
+// Images are listed once per reconcile by migration+VM name prefix so an
+// N-disk VM does not issue N list calls every PollReQ.
 func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
 	element, err := r.isPrismElement()
 	if err != nil {
@@ -336,6 +339,18 @@ func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
 	}
 
 	disks, err := r.vmDisks(vmRef)
+	if err != nil {
+		return false, err
+	}
+
+	prefix := fmt.Sprintf("forklift-migration-%s-%s-", r.Context.Migration.UID, vmRef.ID)
+	var byNameV3 map[string]libclient.V3Image
+	var byNameV4 map[string]libclient.ImageV4
+	if element {
+		byNameV3, err = r.listImagesByNamePrefix(prefix)
+	} else {
+		byNameV4, err = r.listImagesV4ByNamePrefix(prefix)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -348,9 +363,9 @@ func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
 		var diskReady bool
 		var imgErr error
 		if element {
-			diskReady, imgErr = r.ensureImage(vmRef, disk)
+			diskReady, imgErr = r.ensureImage(vmRef, disk, byNameV3)
 		} else {
-			diskReady, imgErr = r.ensureImageV4(vmRef, disk)
+			diskReady, imgErr = r.ensureImageV4(vmRef, disk, byNameV4)
 		}
 		if imgErr != nil {
 			return false, imgErr
@@ -397,14 +412,12 @@ func (r *Client) vmDisks(vmRef ref.Ref) ([]model.Disk, error) {
 }
 
 // ensureImage returns whether disk's catalog image has finished creating,
-// creating it first if it doesn't exist yet.
-func (r *Client) ensureImage(vmRef ref.Ref, disk model.Disk) (ready bool, err error) {
+// creating it first if it doesn't exist yet. byName is the per-reconcile
+// prefix list from PreTransferActions.
+func (r *Client) ensureImage(vmRef ref.Ref, disk model.Disk, byName map[string]libclient.V3Image) (ready bool, err error) {
 	name := r.migrationImageName(vmRef, disk.UUID)
-	entity, err := r.findImageByName(name)
-	if err != nil {
-		return false, err
-	}
-	if entity == nil {
+	entity, ok := byName[name]
+	if !ok {
 		return false, r.createImage(name, disk.UUID)
 	}
 	switch entity.Status.State {
@@ -415,6 +428,27 @@ func (r *Client) ensureImage(vmRef ref.Ref, disk model.Disk) (ready bool, err er
 	default:
 		return false, nil
 	}
+}
+
+// listImagesByNamePrefix returns v3 images whose spec.name starts with
+// prefix, keyed by name. Uses one filtered list call.
+func (r *Client) listImagesByNamePrefix(prefix string) (map[string]libclient.V3Image, error) {
+	entities, err := libclient.ListAllV3[libclient.V3Image](
+		&r.Client,
+		"image",
+		imagePageSize,
+		libclient.V3ImageNamePrefixFilter(prefix),
+	)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]libclient.V3Image, len(entities))
+	for _, e := range entities {
+		if strings.HasPrefix(e.Spec.Name, prefix) {
+			out[e.Spec.Name] = e
+		}
+	}
+	return out, nil
 }
 
 // findImageByName returns the v3 image entity with the given spec.name. entity
