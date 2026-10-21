@@ -32,6 +32,16 @@ import (
 // a more specific Client.Timeout.
 const ConnectionTimeout = 30 * time.Second
 
+// maxHTTPRetries is how many times to reissue a request after Prism returns
+// 429 or 503. Kept small so forklift backs off under load instead of
+// amplifying it.
+const maxHTTPRetries = 3
+
+// retryWait is the default pause between 429/503 retries when Prism does
+// not send Retry-After. Long enough to ease pressure on a soft-limited
+// Prism without stalling a migration reconcile for minutes.
+const retryWait = 2 * time.Second
+
 // maxListPages bounds pagination against a server that ignores page
 // parameters and returns the same page indefinitely.
 var maxListPages = 1000
@@ -198,9 +208,24 @@ func (r *Client) GetNoRedirect(url string) (status int, header http.Header, err 
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return 0, nil, liberr.Wrap(err, "request failed", "url", url)
+
+	var response *http.Response
+	for attempt := 0; ; attempt++ {
+		response, err = client.Do(request)
+		if err != nil {
+			return 0, nil, liberr.Wrap(err, "request failed", "url", url)
+		}
+		if !retryableStatus(response.StatusCode) || attempt >= maxHTTPRetries {
+			break
+		}
+		wait := retryDelay(response.Header.Get("Retry-After"))
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if r.Log != nil {
+			r.Log.Info("Nutanix request rate-limited; retrying",
+				"url", url, "status", response.StatusCode, "attempt", attempt+1, "wait", wait)
+		}
+		time.Sleep(wait)
 	}
 	defer func() {
 		_ = response.Body.Close()
@@ -243,35 +268,56 @@ func (r *Client) Delete(url string, out any) (status int, err error) {
 
 // send issues an authenticated HTTP request with an optional JSON (or raw
 // string) body and optionally decodes a JSON response into `out`.
+// Transient 429/503 responses are retried a few times with backoff so a
+// migration can ride through Prism soft limits without hammering the API.
 func (r *Client) send(method, url string, in, out any, header http.Header) (status int, err error) {
 	parsedURL, err := liburl.Parse(url)
 	if err != nil {
 		return 0, liberr.Wrap(err, "URL not valid", "url", url)
 	}
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if in != nil {
 		switch v := in.(type) {
 		case string:
-			bodyReader = strings.NewReader(v)
+			bodyBytes = []byte(v)
 		default:
-			var marshaled []byte
-			marshaled, err = json.Marshal(in)
+			bodyBytes, err = json.Marshal(in)
 			if err != nil {
 				return 0, liberr.Wrap(err, "json marshal failed", "url", url)
 			}
-			bodyReader = bytes.NewReader(marshaled)
 		}
 	}
-	request, err := http.NewRequest(method, parsedURL.String(), bodyReader)
-	if err != nil {
-		return 0, liberr.Wrap(err, "failed to build request", "url", url)
-	}
-	request.Header = header
 
 	client := r.httpClient()
-	response, err := client.Do(request)
-	if err != nil {
-		return 0, liberr.Wrap(err, method+" failed", "url", url)
+	var response *http.Response
+	for attempt := 0; ; attempt++ {
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		var request *http.Request
+		request, err = http.NewRequest(method, parsedURL.String(), bodyReader)
+		if err != nil {
+			return 0, liberr.Wrap(err, "failed to build request", "url", url)
+		}
+		request.Header = header.Clone()
+
+		response, err = client.Do(request)
+		if err != nil {
+			return 0, liberr.Wrap(err, method+" failed", "url", url)
+		}
+		if !retryableStatus(response.StatusCode) || attempt >= maxHTTPRetries {
+			break
+		}
+		wait := retryDelay(response.Header.Get("Retry-After"))
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if r.Log != nil {
+			r.Log.Info("Nutanix request rate-limited; retrying",
+				"method", method, "url", url, "status", response.StatusCode,
+				"attempt", attempt+1, "wait", wait)
+		}
+		time.Sleep(wait)
 	}
 	defer func() {
 		_ = response.Body.Close()
@@ -287,6 +333,18 @@ func (r *Client) send(method, url string, in, out any, header http.Header) (stat
 		}
 	}
 	return status, nil
+}
+
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable
+}
+
+// retryDelay honors Retry-After (seconds) when present; otherwise retryWait.
+func retryDelay(retryAfter string) time.Duration {
+	if secs, err := strconv.Atoi(retryAfter); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return retryWait
 }
 
 // ListV3 resources using the Nutanix v3 API pattern: POST with an

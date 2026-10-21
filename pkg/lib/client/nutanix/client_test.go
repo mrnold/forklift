@@ -471,3 +471,73 @@ func TestSendUsesFixedLengthBody(t *testing.T) {
 		t.Fatalf("Post failed: status=%d err=%v", status, err)
 	}
 }
+
+// TestSendRetriesRateLimit verifies send backs off on 429/503 and succeeds
+// once Prism answers OK. Retry-After: 0 keeps the test fast.
+func TestSendRetriesRateLimit(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/nutanix/v3/clusters/list" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+			return
+		}
+		n := hits.Add(1)
+		if n <= 2 {
+			w.Header().Set("Retry-After", "0")
+			if n == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	var result map[string]interface{}
+	status, err := client.Get(server.URL+"/thing", &result)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("Get failed: status=%d err=%v", status, err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("unexpected result: %v", result)
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("expected 3 attempts (429, 503, 200), got %d", hits.Load())
+	}
+}
+
+// TestSendRateLimitExhausted verifies the final 429/503 is returned after
+// maxHTTPRetries instead of looping forever.
+func TestSendRateLimitExhausted(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/nutanix/v3/clusters/list" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	status, err := client.Get(server.URL+"/thing", &map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected status %d, got %d", http.StatusTooManyRequests, status)
+	}
+	// initial attempt + maxHTTPRetries
+	if want := int32(maxHTTPRetries + 1); hits.Load() != want {
+		t.Fatalf("expected %d attempts, got %d", want, hits.Load())
+	}
+}
