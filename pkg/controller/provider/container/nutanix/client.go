@@ -24,9 +24,14 @@ const (
 const (
 	clusterPageSize = 100
 	hostPageSize    = 1000
-	vmPageSize      = 100
-	subnetPageSize  = 500
-	imagePageSize   = 500
+	// VMs are the largest list on most providers, so each refresh pass pages
+	// them more than any other resource. A larger page size proportionally
+	// reduces the number of VM-list requests (and their per-request IAM auth)
+	// per pass. 500 is the v3 list length ceiling; VM entities are the heaviest
+	// per item, so dial this back if large pages approach the client timeout.
+	vmPageSize     = 500
+	subnetPageSize = 500
+	imagePageSize  = 500
 	// Per-request page sizes for v4 "config"/"content" namespace endpoints.
 	// ListAllV4 pages through as many requests as needed regardless of
 	// these values; the v4 image endpoint additionally caps $limit at 100.
