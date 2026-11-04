@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	liburl "net/url"
 	"strconv"
 	"strings"
@@ -55,6 +56,9 @@ type Client struct {
 
 	mu     sync.Mutex
 	client *libweb.Client
+	// jar stores Prism session cookies from Set-Cookie so later requests
+	// can omit Basic auth and avoid a fresh IAM login per call.
+	jar http.CookieJar
 }
 
 // Connect and authenticate with Nutanix Prism. Idempotent: repeated calls
@@ -107,6 +111,12 @@ func (r *Client) Connect() (status int, err error) {
 		responseHeaderTimeout = ConnectionTimeout
 	}
 
+	jar, jarErr := cookiejar.New(nil)
+	if jarErr != nil {
+		return http.StatusInternalServerError, liberr.Wrap(jarErr, "failed to create cookie jar")
+	}
+	r.jar = jar
+
 	r.client = &libweb.Client{
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -126,6 +136,7 @@ func (r *Client) Connect() (status int, err error) {
 	status, err = r.testConnection()
 	if err != nil {
 		r.client = nil
+		r.jar = nil
 		return status, err
 	}
 
@@ -188,19 +199,34 @@ func (r *Client) GetNoRedirect(url string) (status int, header http.Header, err 
 		return
 	}
 
-	request, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 0, nil, liberr.Wrap(err, "failed to build request", "url", url)
-	}
-	request.Header = r.createAuthHeader()
-
 	client := r.httpClient()
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return 0, nil, liberr.Wrap(err, "request failed", "url", url)
+
+	reqHeader := r.createAuthHeader()
+	var response *http.Response
+	sessionRetried := false
+	for {
+		request, reqErr := http.NewRequest(http.MethodGet, url, nil)
+		if reqErr != nil {
+			return 0, nil, liberr.Wrap(reqErr, "failed to build request", "url", url)
+		}
+		request.Header = reqHeader.Clone()
+		r.applyAuth(request.Header)
+
+		response, err = client.Do(request)
+		if err != nil {
+			return 0, nil, liberr.Wrap(err, "request failed", "url", url)
+		}
+		if response.StatusCode == http.StatusUnauthorized && !sessionRetried && r.hasSession() {
+			sessionRetried = true
+			r.clearSession()
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			continue
+		}
+		break
 	}
 	defer func() {
 		_ = response.Body.Close()
@@ -208,6 +234,7 @@ func (r *Client) GetNoRedirect(url string) (status int, header http.Header, err 
 
 	return response.StatusCode, response.Header, nil
 }
+
 
 // Post issues an authenticated POST request. Nutanix v3 uses POST for list
 // operations as well as creation. Mutating v4 endpoints require a unique
@@ -248,30 +275,47 @@ func (r *Client) send(method, url string, in, out any, header http.Header) (stat
 	if err != nil {
 		return 0, liberr.Wrap(err, "URL not valid", "url", url)
 	}
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if in != nil {
 		switch v := in.(type) {
 		case string:
-			bodyReader = strings.NewReader(v)
+			bodyBytes = []byte(v)
 		default:
-			var marshaled []byte
-			marshaled, err = json.Marshal(in)
+			bodyBytes, err = json.Marshal(in)
 			if err != nil {
 				return 0, liberr.Wrap(err, "json marshal failed", "url", url)
 			}
-			bodyReader = bytes.NewReader(marshaled)
 		}
 	}
-	request, err := http.NewRequest(method, parsedURL.String(), bodyReader)
-	if err != nil {
-		return 0, liberr.Wrap(err, "failed to build request", "url", url)
-	}
-	request.Header = header
 
 	client := r.httpClient()
-	response, err := client.Do(request)
-	if err != nil {
-		return 0, liberr.Wrap(err, method+" failed", "url", url)
+	var response *http.Response
+	sessionRetried := false
+	for {
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		var request *http.Request
+		request, err = http.NewRequest(method, parsedURL.String(), bodyReader)
+		if err != nil {
+			return 0, liberr.Wrap(err, "failed to build request", "url", url)
+		}
+		request.Header = header.Clone()
+		r.applyAuth(request.Header)
+
+		response, err = client.Do(request)
+		if err != nil {
+			return 0, liberr.Wrap(err, method+" failed", "url", url)
+		}
+		if response.StatusCode == http.StatusUnauthorized && !sessionRetried && r.hasSession() {
+			sessionRetried = true
+			r.clearSession()
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			continue
+		}
+		break
 	}
 	defer func() {
 		_ = response.Body.Close()
@@ -288,6 +332,7 @@ func (r *Client) send(method, url string, in, out any, header http.Header) (stat
 	}
 	return status, nil
 }
+
 
 // ListV3 resources using the Nutanix v3 API pattern: POST with an
 // offset/length body. filter is optional (empty omits the filter field).
@@ -402,19 +447,64 @@ func (r *Client) httpClient() http.Client {
 	return http.Client{
 		Transport: r.client.Transport,
 		Timeout:   timeout,
+		Jar:       r.jar,
 	}
 }
 
-// createAuthHeader builds a Basic Auth header from Secret's user/password.
+// createAuthHeader builds the shared Content-Type header. Authorization is
+// applied per request by applyAuth so a live session cookie can replace
+// Basic auth after Connect.
 func (r *Client) createAuthHeader() http.Header {
-	user := string(r.Secret.Data["user"])
-	password := string(r.Secret.Data["password"])
-
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
-	header.Set("Authorization", "Basic "+basicAuth(user, password))
-
 	return header
+}
+
+// applyAuth sets Basic auth when no Prism session cookie is present.
+// When the jar already holds cookies for this host, Basic is omitted so
+// the request reuses the session and skips a fresh IAM login.
+func (r *Client) applyAuth(header http.Header) {
+	header.Del("Authorization")
+	if r.hasSession() {
+		return
+	}
+	user := string(r.Secret.Data["user"])
+	password := string(r.Secret.Data["password"])
+	header.Set("Authorization", "Basic "+basicAuth(user, password))
+}
+
+func (r *Client) hasSession() bool {
+	if r.jar == nil {
+		return false
+	}
+	u, err := liburl.Parse(r.URL)
+	if err != nil {
+		return false
+	}
+	return len(r.jar.Cookies(u)) > 0
+}
+
+// clearSession drops stored cookies so the next request re-authenticates
+// with Basic (e.g. after a 401 from an expired Prism session).
+func (r *Client) clearSession() {
+	if r.jar == nil {
+		return
+	}
+	u, err := liburl.Parse(r.URL)
+	if err != nil {
+		return
+	}
+	cookies := r.jar.Cookies(u)
+	if len(cookies) == 0 {
+		return
+	}
+	expired := make([]*http.Cookie, len(cookies))
+	for i, c := range cookies {
+		cc := *c
+		cc.MaxAge = -1
+		expired[i] = &cc
+	}
+	r.jar.SetCookies(u, expired)
 }
 
 // createMutatingHeader is createAuthHeader plus a fresh NTNX-Request-Id.

@@ -471,3 +471,86 @@ func TestSendUsesFixedLengthBody(t *testing.T) {
 		t.Fatalf("Post failed: status=%d err=%v", status, err)
 	}
 }
+
+// TestSessionReuse verifies that after Prism Set-Cookie on Connect, later
+// requests send the cookie and omit Basic auth (avoiding a fresh IAM login).
+func TestSessionReuse(t *testing.T) {
+	var gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/nutanix/v3/clusters/list" {
+			if r.Header.Get("Authorization") == "" {
+				t.Error("connect probe expected Basic Authorization")
+			}
+			w.Header().Set("Set-Cookie", "NTNX_IG=session-token; Path=/; HttpOnly")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+			return
+		}
+		gets.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("session request should omit Authorization")
+		}
+		cookie, err := r.Cookie("NTNX_IG")
+		if err != nil || cookie.Value != "session-token" {
+			t.Errorf("expected NTNX_IG cookie, got %v err=%v", cookie, err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	var result map[string]interface{}
+	status, err := client.Get(server.URL+"/thing", &result)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("Get failed: status=%d err=%v", status, err)
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("expected 1 Get after connect, got %d", gets.Load())
+	}
+}
+
+// TestSessionRefreshOn401 verifies an expired session is cleared and the
+// request is retried once with Basic auth.
+func TestSessionRefreshOn401(t *testing.T) {
+	var gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/nutanix/v3/clusters/list" {
+			w.Header().Set("Set-Cookie", "NTNX_IG=session-token; Path=/; HttpOnly")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"entities":[]}`))
+			return
+		}
+		n := gets.Add(1)
+		if n == 1 {
+			if r.Header.Get("Authorization") != "" {
+				t.Error("first Get should use session, not Basic")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("Authorization") == "" {
+			t.Error("retry after 401 expected Basic Authorization")
+		}
+		w.Header().Set("Set-Cookie", "NTNX_IG=new-session; Path=/; HttpOnly")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	var result map[string]interface{}
+	status, err := client.Get(server.URL+"/thing", &result)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("Get failed: status=%d err=%v", status, err)
+	}
+	if gets.Load() != 2 {
+		t.Fatalf("expected 2 Gets (401 then Basic retry), got %d", gets.Load())
+	}
+	if !client.hasSession() {
+		t.Fatal("expected new session cookie after Basic retry")
+	}
+}
+
