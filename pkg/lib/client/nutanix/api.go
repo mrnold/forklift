@@ -57,6 +57,14 @@ func V3ImageNameFilter(name string) string {
 	return "name==" + escapeFIQLLiteral(name)
 }
 
+// V3ImageNamePrefixFilter returns a v3 list FIQL filter matching image
+// names that start with prefix. Prism Element's image list treats the
+// value as a regex, so the wildcard is ".*" (a trailing bare "*" matches
+// nothing).
+func V3ImageNamePrefixFilter(prefix string) string {
+	return "name==" + escapeFIQLLiteral(prefix) + ".*"
+}
+
 func escapeFIQLLiteral(value string) string {
 	if value == "" {
 		return "''"
