@@ -20,8 +20,11 @@ import (
 const (
 	// Retry interval.
 	RetryInterval = 5 * time.Second
-	// Refresh interval.
-	RefreshInterval = 10 * time.Second
+	// Default interval between inventory refresh passes. Each pass re-lists
+	// every resource type, so on large Prism Central deployments a short
+	// interval is a significant, continuous source of API (and IAM auth)
+	// load. Tunable per-provider via the nutanixRefreshInterval setting.
+	DefaultRefreshInterval = 60 * time.Second
 	// Default timeout for the HTTP client
 	DefaultClientTimeout = 30 * time.Second
 )
@@ -51,6 +54,8 @@ type Collector struct {
 	cancel func()
 	// Phase
 	phase string
+	// Interval between inventory refresh passes.
+	refreshInterval time.Duration
 	// Context
 	ctx context.Context
 }
@@ -70,10 +75,17 @@ func New(db libmodel.DB, provider *api.Provider, secret *core.Secret) (r *Collec
 
 	var err error
 	clientTimeout := DefaultClientTimeout
-	if timeout, ok := provider.Spec.Settings["nutanixClientTimeout"]; ok {
-		if clientTimeout, err = time.ParseDuration(timeout); err != nil {
-			log.Error(err, "Couldn't parse timeout, falling back to default")
+	if timeout, ok := provider.Spec.Settings[api.NutanixClientTimeout]; ok {
+		if clientTimeout, err = time.ParseDuration(timeout); err != nil || clientTimeout <= 0 {
+			log.Error(err, "Couldn't parse client timeout, falling back to default", "value", timeout)
 			clientTimeout = DefaultClientTimeout
+		}
+	}
+	refreshInterval := DefaultRefreshInterval
+	if interval, ok := provider.Spec.Settings[api.NutanixRefreshInterval]; ok {
+		if refreshInterval, err = time.ParseDuration(interval); err != nil || refreshInterval <= 0 {
+			log.Error(err, "Couldn't parse refresh interval, falling back to default", "value", interval)
+			refreshInterval = DefaultRefreshInterval
 		}
 	}
 	r = &Collector{
@@ -84,9 +96,10 @@ func New(db libmodel.DB, provider *api.Provider, secret *core.Secret) (r *Collec
 			log:           clientLog,
 			clientTimeout: clientTimeout,
 		},
-		provider: provider,
-		db:       db,
-		log:      log,
+		provider:        provider,
+		db:              db,
+		log:             log,
+		refreshInterval: refreshInterval,
 	}
 
 	return
@@ -203,7 +216,7 @@ func (r *Collector) run() (err error) {
 		err = r.collect()
 		if err == nil {
 			r.parity = true
-			time.Sleep(RefreshInterval)
+			time.Sleep(r.refreshInterval)
 		} else {
 			r.parity = false
 		}

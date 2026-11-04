@@ -87,10 +87,13 @@ const (
 	// Nutanix Prism endpoint settings.
 	NutanixPrismType   = "prismType"
 	NutanixClusterUUID = "clusterUuid"
-	AzureSnapshotSku   = "snapshotSku"
-	AzureSnapshotRG    = "snapshotResourceGroup"
-	AzureTargetRegion  = "targetRegion"
-	AzureSnapshotClass = "volumeSnapshotClassName"
+	// Nutanix collector tuning (optional, Go duration strings e.g. "60s", "5m").
+	NutanixClientTimeout   = "nutanixClientTimeout"
+	NutanixRefreshInterval = "nutanixRefreshInterval"
+	AzureSnapshotSku       = "snapshotSku"
+	AzureSnapshotRG        = "snapshotResourceGroup"
+	AzureTargetRegion      = "targetRegion"
+	AzureSnapshotClass     = "volumeSnapshotClassName"
 	// vSphere copyApplianceTemplate / copy-appliance placement (per provider).
 	CopyApplianceDatastore    = "copyApplianceDatastore"
 	CopyApplianceFolder       = "copyApplianceFolder"
