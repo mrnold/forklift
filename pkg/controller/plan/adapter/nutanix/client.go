@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	api "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
 	planapi "github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
@@ -69,8 +70,29 @@ func (r *Client) connect() error {
 	r.URL = r.Context.Source.Provider.Spec.URL
 	r.Secret = r.Context.Source.Secret
 	r.Log = r.Context.Log.WithName("client")
+	r.Timeout = r.clientTimeout()
 	_, err := r.Connect()
 	return err
+}
+
+// clientTimeout resolves the per-request HTTP timeout from the optional
+// nutanixClientTimeout provider setting (a Go duration string, e.g. "45s"),
+// falling back to the shared client default when the setting is unset or
+// invalid. The same setting tunes the inventory collector's client; honoring
+// it here lets a migration against a Prism Central whose image service is slow
+// to respond raise the timeout instead of failing disk-transfer setup at the
+// default 30s.
+func (r *Client) clientTimeout() time.Duration {
+	raw, ok := r.Context.Source.Provider.Spec.Settings[api.NutanixClientTimeout]
+	if !ok {
+		return libclient.ConnectionTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		r.Log.Error(err, "Couldn't parse nutanixClientTimeout, using default", "value", raw)
+		return libclient.ConnectionTimeout
+	}
+	return timeout
 }
 
 func (r *Client) Close() {}
