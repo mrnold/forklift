@@ -1,0 +1,140 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.3
+  name: changedblockstackers.forklift.konveyor.io
+spec:
+  group: forklift.konveyor.io
+  names:
+    kind: ChangedBlockStacker
+    listKind: ChangedBlockStackerList
+    plural: changedblockstackers
+    shortNames:
+    - cbs
+    - cbses
+    singular: changedblockstacker
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ChangedBlockStacker coordinates copying disk data differences between two checkpoints, or snapshots,
+          or restore points, or whatever other terminology is used by a source provider for a warm migration.
+          Each ChangedBlockStacker finds a list of changed blocks and stacks them on top of an existing PVC,
+          and the final disk is built up layer by layer while the source VM is still running. As a side effect,
+          this can handle cold migration just by not specifying any beginning checkpoint.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              from:
+                description: |-
+                  Starting checkpoint reference, differences are computed between here and "To"
+                  Leave empty to copy the whole disk for cold migration
+                type: string
+              nutanix:
+                description: Sources, exactly one should be filled out
+                type: object
+              pvc:
+                description: Name of the PVC to receive data
+                type: string
+              to:
+                description: Ending checkpoint reference, different sources may have
+                  different formats
+                type: string
+              vmware:
+                type: object
+            required:
+            - pvc
+            type: object
+          status:
+            properties:
+              bytesCopied:
+                description: Bytes copied so far for this delta
+                format: int64
+                type: integer
+              conditions:
+                description: List of conditions.
+                items:
+                  description: Condition
+                  properties:
+                    category:
+                      description: The condition category.
+                      type: string
+                    durable:
+                      description: The condition is durable - never un-staged.
+                      type: boolean
+                    items:
+                      description: A list of items referenced in the `Message`.
+                      items:
+                        type: string
+                      type: array
+                    lastTransitionTime:
+                      description: When the last status transition occurred.
+                      format: date-time
+                      type: string
+                    message:
+                      description: The human readable description of the condition.
+                      type: string
+                    reason:
+                      description: The reason for the condition or transition.
+                      type: string
+                    status:
+                      description: The condition status [true,false].
+                      type: string
+                    suggestion:
+                      description: A suggested action or resolution for the condition.
+                      type: string
+                    type:
+                      description: The condition type.
+                      type: string
+                  required:
+                  - category
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              cursor:
+                properties:
+                  offset:
+                    description: |-
+                      Raw disk offset. Everything up to this point has been copied.
+                      As long as To and From have not changed, it should be safe to resume from here.
+                    format: int64
+                    type: integer
+                type: object
+              phase:
+                enum:
+                - Pending
+                - Running
+                - Succeeded
+                - Failed
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
