@@ -110,6 +110,11 @@ var (
 			resource:           api.VSphereXcopyVolumePopulatorResource,
 			regexKey:           "vsphere_xcopy_volume_populator",
 		},
+		api.NutanixNfsVolumePopulatorKind: {
+			storageResourceKey: "sourcePath",
+			resource:           api.NutanixNfsVolumePopulatorResource,
+			regexKey:           "nutanix_nfs_populator_progress",
+		},
 	}
 
 	monitoredPVCs = map[string]interface{}{}

@@ -1237,7 +1237,20 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 
 			bindPVCs := append(populatorPVCs, resolvedCsiPVCs...)
 			if len(bindPVCs) > 0 {
-				err = r.kubevirt.EnsurePVCInitPod(vm, bindPVCs)
+				// Builder-returned populator PVCs often lack Status (e.g. Nutanix
+				// AlreadyExists path copies only ObjectMeta). Re-fetch so
+				// EnsurePVCInitPod sees ClaimPending and mounts every WFFC volume.
+				var livePVCs []*core.PersistentVolumeClaim
+				if livePVCs, err = r.kubevirt.getPVCs(vm.Ref); err != nil {
+					if !errors.As(err, &web.ProviderNotReadyError{}) {
+						step.AddError(err.Error())
+						err = nil
+						break
+					} else {
+						return
+					}
+				}
+				err = r.kubevirt.EnsurePVCInitPod(vm, livePVCs)
 				if err != nil {
 					if !errors.As(err, &web.ProviderNotReadyError{}) {
 						step.AddError(err.Error())

@@ -1355,17 +1355,17 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				"storageContainer", disk.StorageContainerUUID)
 		}
 
-		// Default to Filesystem: NFS-backed storage classes (e.g. nfs-csi,
-		// common for this path) don't support raw Block volumes. The storage
-		// map can override for block-capable backends. The copy binary handles
-		// both (writes /mnt/disk.img in filesystem mode).
-		volumeMode := core.PersistentVolumeFilesystem
-		if destination.VolumeMode != "" {
-			volumeMode = destination.VolumeMode
+		storageClass := destination.StorageClass
+		accessModes, volumeMode, err := r.getVolumeAndAccessMode(storageClass)
+		if err != nil {
+			return nil, err
 		}
-		accessMode := core.ReadWriteOnce
 		if destination.AccessMode != "" {
-			accessMode = destination.AccessMode
+			accessModes = []core.PersistentVolumeAccessMode{destination.AccessMode}
+		}
+		if destination.VolumeMode != "" {
+			mode := destination.VolumeMode
+			volumeMode = &mode
 		}
 
 		pvcAnnotations := map[string]string{}
@@ -1376,7 +1376,6 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		// GetPopulatorTaskName / ResolvePersistentVolumeClaimIdentifier read.
 		pvcAnnotations[planbase.AnnDiskSource] = disk.UUID
 
-		storageClass := destination.StorageClass
 		// Include the migration UID so a retried migration gets fresh CRs/PVCs
 		// instead of colliding (AlreadyExists) with a stale one from a prior
 		// attempt that points at an image a previous Finalize already deleted.
@@ -1398,9 +1397,9 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				Annotations: pvcAnnotations,
 			},
 			Spec: core.PersistentVolumeClaimSpec{
-				AccessModes:      []core.PersistentVolumeAccessMode{accessMode},
+				AccessModes:      accessModes,
 				StorageClassName: &storageClass,
-				VolumeMode:       &volumeMode,
+				VolumeMode:       volumeMode,
 				Resources: core.VolumeResourceRequirements{
 					Requests: core.ResourceList{
 						core.ResourceStorage: *resource.NewQuantity(disk.DiskSizeBytes, resource.BinarySI),
@@ -1537,6 +1536,28 @@ func tlsConfigFromSecret(secret *core.Secret) *tls.Config {
 		}
 	}
 	return cfg
+}
+
+// getVolumeAndAccessMode reads the CDI StorageProfile for storageClassName,
+// matching the oVirt/OpenStack populator helpers so an empty StorageMap
+// accessMode does not hardcode ReadWriteOnce (which blocks LiveMigratable).
+func (r *Builder) getVolumeAndAccessMode(storageClassName string) ([]core.PersistentVolumeAccessMode, *core.PersistentVolumeMode, error) {
+	filesystemMode := core.PersistentVolumeFilesystem
+	storageProfile := &cdi.StorageProfile{}
+	err := r.Destination.Get(context.TODO(), types.NamespacedName{Name: storageClassName}, storageProfile)
+	if err != nil {
+		return nil, nil, liberr.Wrap(err, "storageClassName", storageClassName)
+	}
+	if len(storageProfile.Status.ClaimPropertySets) > 0 &&
+		len(storageProfile.Status.ClaimPropertySets[0].AccessModes) > 0 {
+		accessModes := storageProfile.Status.ClaimPropertySets[0].AccessModes
+		volumeMode := storageProfile.Status.ClaimPropertySets[0].VolumeMode
+		if volumeMode == nil {
+			volumeMode = &filesystemMode
+		}
+		return accessModes, volumeMode, nil
+	}
+	return nil, nil, liberr.New("no accessMode defined on StorageProfile for StorageClass", "storageClassName", storageClassName)
 }
 
 // ensurePopulatorPVCAndCR creates the target PVC and its populator CR
