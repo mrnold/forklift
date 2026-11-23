@@ -79,7 +79,13 @@ func (r *Client) Close() {}
 // with them. Deletion failures are logged rather than returned, since
 // finalization runs after the migration's outcome is already decided and a
 // leftover image shouldn't be reported as a migration failure.
+//
+// NFS transfer never creates catalog images (it reads the VM's own vmdisk),
+// so there is nothing to clean up.
 func (r *Client) Finalize(vms []*planapi.VMStatus, _ string) {
+	if r.Context.Source.Provider.Setting(api.NutanixDiskTransferMethod) == string(api.DiskTransferNFS) {
+		return
+	}
 	element, err := r.isPrismElement()
 	if err != nil {
 		r.Context.Log.Error(err, "Failed to detect Prism endpoint type during image cleanup")
@@ -326,10 +332,19 @@ func (r *Client) GetSnapshotDeltas(_ ref.Ref, _ string, _ util.HostsFunc) (s map
 // for Builder.DataVolumes. Returns ready=true only once every disk's
 // image has finished creating.
 //
+// NFS transfer skips catalog images entirely: the populator reads the
+// VM's own backing vmdisk over the storage-container NFS export, so
+// there is nothing to wait on here (cold migration has already powered
+// the source off before CreateDataVolumes).
+//
 // Prism Element uses the v3 Image Service (GET /images/{uuid}/file);
 // Prism Central uses the v4 Image Service instead, since v3 image
 // creation/listing isn't reliably populated when queried through it.
 func (r *Client) PreTransferActions(vmRef ref.Ref) (ready bool, err error) {
+	if r.Context.Source.Provider.Setting(api.NutanixDiskTransferMethod) == string(api.DiskTransferNFS) {
+		return true, nil
+	}
+
 	element, err := r.isPrismElement()
 	if err != nil {
 		return false, err

@@ -1334,9 +1334,8 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		return nil, liberr.New("cluster has no external IP for NFS transfer", "cluster", vm.Cluster)
 	}
 
-	// The catalog image lookup goes through Prism Central's proxy when the
-	// provider is Prism Central, so it needs to know which endpoint type the
-	// provider points at.
+	// Inventory disk.UUID is the guest device UUID; the NFS file is named
+	// after the backing vmdisk UUID. Resolve via PE v2 /virtual_disks/.
 	client := &Client{Context: r.Context}
 	if err = client.connect(); err != nil {
 		return nil, err
@@ -1345,11 +1344,18 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 	if err != nil {
 		return nil, err
 	}
-	imageListURL := catalogImageListURL(r.Source.Provider.Spec.URL, cluster, element)
+	disks := dataDisks(vm)
+	deviceUUIDs := make([]string, 0, len(disks))
+	for _, disk := range disks {
+		deviceUUIDs = append(deviceUUIDs, disk.UUID)
+	}
+	vmDiskByDevice, err := r.resolveVmDiskUUIDs(client, virtualDiskListURL(r.Source.Provider.Spec.URL, cluster, element), deviceUUIDs)
+	if err != nil {
+		return nil, liberr.Wrap(err, "vm", vmRef.String())
+	}
 
 	namespace := r.Plan.Spec.TargetNamespace
-	diskIndex := 0
-	for _, disk := range dataDisks(vm) {
+	for _, disk := range disks {
 		destination, mapped := storageMap[disk.StorageContainerUUID]
 		if !mapped {
 			return nil, liberr.New(
@@ -1364,6 +1370,13 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				"vm", vmRef.String(),
 				"disk", disk.UUID,
 				"storageContainer", disk.StorageContainerUUID)
+		}
+		vmDiskID := vmDiskByDevice[disk.UUID]
+		if vmDiskID == "" {
+			return nil, liberr.New(
+				"backing vmdisk not found for device uuid",
+				"vm", vmRef.String(),
+				"disk", disk.UUID)
 		}
 
 		pvcAnnotations := map[string]string{}
@@ -1391,9 +1404,8 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 
 		// Include the migration UID so a retried migration gets fresh CRs/PVCs
 		// instead of colliding (AlreadyExists) with a stale one from a prior
-		// attempt that points at an image a previous Finalize already deleted.
-		// Hashed to stay within the 63-char name limit; stable within a
-		// migration so re-reconciles are idempotent.
+		// attempt. Hashed to stay within the 63-char name limit; stable within
+		// a migration so re-reconciles are idempotent.
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%s-%s", r.Migration.UID, vmRef.ID, disk.UUID)))
 		name := fmt.Sprintf("nnvp-%x", sum[:12])
 		labels := map[string]string{
@@ -1426,27 +1438,11 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 			},
 		}
 
-		// Read the immutable catalog-image clone PreTransferActions created,
-		// not the live source vmdisk -- so a concurrent power-on of the source
-		// VM can't tear the copy. The clone's backing vmdisk UUID and container
-		// come from the PE v2 image API (v3/v4 don't expose them).
-		imageName := migrationImageName(string(r.Migration.UID), vmRef, disk.UUID)
-		vmDiskID, imgContainerUUID, rerr := r.resolveCatalogImage(client, imageListURL, imageName)
-		if rerr != nil {
-			return nil, rerr
-		}
-		export := disk.StorageContainerName
-		if imgContainerUUID != "" && imgContainerUUID != disk.StorageContainerUUID {
-			sc := &model.StorageContainer{}
-			if ferr := r.Source.Inventory.Find(sc, ref.Ref{ID: imgContainerUUID}); ferr == nil && sc.Name != "" {
-				export = sc.Name
-			} else {
-				return nil, liberr.New(
-					"catalog image landed on an unknown container",
-					"image", imageName, "container", imgContainerUUID)
-			}
-		}
-
+		// Read the VM's own backing vmdisk over NFS. Cold migration powers
+		// the source off before CreateDataVolumes, so a catalog-image clone
+		// is unnecessary (and the PE v2 /images list that resolved it was
+		// stalling migrations under load). SourcePath uses the vmdisk UUID
+		// from /virtual_disks/, not inventory disk.UUID (device UUID).
 		populator := &api.NutanixNfsVolumePopulator{
 			ObjectMeta: meta.ObjectMeta{
 				Namespace: namespace,
@@ -1455,7 +1451,7 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 			},
 			Spec: api.NutanixNfsVolumePopulatorSpec{
 				ServerIP:      cluster.ExternalIP,
-				Export:        export,
+				Export:        disk.StorageContainerName,
 				SourcePath:    path.Join(".acropolis", "vmdisk", vmDiskID),
 				DiskSizeBytes: disk.DiskSizeBytes,
 				// The populator machinery wires this secret into the copy pod
@@ -1470,10 +1466,92 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 			return nil, err
 		}
 		pvcs = append(pvcs, pvc)
-		diskIndex++
 	}
 
 	return pvcs, nil
+}
+
+// v2VirtualDisk is the subset of the Prism Element v2 virtual_disks entity
+// needed to map inventory device UUIDs onto NFS vmdisk file UUIDs.
+type v2VirtualDisk struct {
+	UUID       string `json:"uuid"`
+	DeviceUUID string `json:"device_uuid"`
+}
+
+// virtualDiskListURL returns the Prism Element v2 virtual_disks list endpoint.
+// Same PE-direct / PC-proxy split as catalogImageListURL: PE credentials go
+// to the cluster VIP; PC credentials stay on Prism Central with
+// proxyClusterUuid so PC forwards to the owning PE.
+func virtualDiskListURL(providerURL string, cluster *model.Cluster, element bool) string {
+	const disksPath = "/PrismGateway/services/rest/v2.0/virtual_disks/"
+	if element {
+		return fmt.Sprintf("https://%s:9440%s", cluster.ExternalIP, disksPath)
+	}
+	query := url.Values{}
+	query.Set("proxyClusterUuid", cluster.ID)
+	return fmt.Sprintf("%s%s?%s", strings.TrimRight(providerURL, "/"), disksPath, query.Encode())
+}
+
+// resolveVmDiskUUIDs maps guest device UUIDs (inventory disk.UUID) to backing
+// vmdisk UUIDs via PE v2 /virtual_disks/. The NFS export stores each disk as
+// .acropolis/vmdisk/<vmdisk-uuid>; the device UUID is not a path component.
+func (r *Builder) resolveVmDiskUUIDs(client *Client, endpoint string, deviceUUIDs []string) (map[string]string, error) {
+	wanted := make(map[string]struct{}, len(deviceUUIDs))
+	for _, id := range deviceUUIDs {
+		wanted[id] = struct{}{}
+	}
+	found := make(map[string]string, len(deviceUUIDs))
+	const pageSize = 500
+	for page := 1; ; page++ {
+		pageURL, err := virtualDiskPageURL(endpoint, page, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		var out struct {
+			Metadata struct {
+				GrandTotal int `json:"grand_total_entities"`
+				EndIndex   int `json:"end_index"`
+			} `json:"metadata"`
+			Entities []v2VirtualDisk `json:"entities"`
+		}
+		status, err := client.Get(pageURL, &out)
+		if err != nil {
+			return nil, liberr.Wrap(err, "endpoint", pageURL)
+		}
+		if status != http.StatusOK {
+			return nil, liberr.New("v2 virtual_disks list failed", "endpoint", pageURL, "status", status)
+		}
+		for _, e := range out.Entities {
+			if _, ok := wanted[e.DeviceUUID]; ok && e.UUID != "" {
+				found[e.DeviceUUID] = e.UUID
+			}
+		}
+		if len(found) == len(wanted) {
+			return found, nil
+		}
+		if len(out.Entities) == 0 || out.Metadata.EndIndex >= out.Metadata.GrandTotal {
+			break
+		}
+	}
+	missing := make([]string, 0, len(wanted)-len(found))
+	for id := range wanted {
+		if _, ok := found[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return nil, liberr.New("backing vmdisk not found for device uuid", "missing", strings.Join(missing, ","))
+}
+
+func virtualDiskPageURL(endpoint string, page, count int) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", liberr.Wrap(err, "endpoint", endpoint)
+	}
+	query := parsed.Query()
+	query.Set("count", strconv.Itoa(count))
+	query.Set("page", strconv.Itoa(page))
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 // v2Image is the subset of the Prism Element v2 image API response we need to
