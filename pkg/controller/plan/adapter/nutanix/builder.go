@@ -1409,9 +1409,12 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%s-%s", r.Migration.UID, vmRef.ID, disk.UUID)))
 		name := fmt.Sprintf("nnvp-%x", sum[:12])
 		labels := map[string]string{
-			"migration": string(r.Migration.UID),
-			"plan":      string(r.Plan.GetUID()),
-			"vmID":      vmRef.ID,
+			"migration":         string(r.Migration.UID),
+			"plan":              string(r.Plan.GetUID()),
+			"vmID":              vmRef.ID,
+			// Keys populator-machinery MAX_POPULATOR_INFLIGHT per PE so
+			// NFS does not start every disk's populate pod at once.
+			api.LabelSourceHost: cluster.ID,
 		}
 
 		pvc := &core.PersistentVolumeClaim{
