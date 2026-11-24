@@ -167,17 +167,18 @@ func (h *NetworkHandler) filter(ctx *gin.Context, list *[]model.Network) (err er
 // REST resource.
 type Network struct {
 	Resource
-	NetworkUUID    string   `json:"networkUuid"`
-	Cluster        string   `json:"cluster"`
-	SubnetType     string   `json:"subnetType"`
-	VlanID         int      `json:"vlanId"`
-	NetworkAddress string   `json:"networkAddress"`
-	PrefixLength   int      `json:"prefixLength"`
-	DefaultGateway string   `json:"defaultGateway"`
-	DHCPServerIP   string   `json:"dhcpServerIp"`
-	DHCPDomainName string   `json:"dhcpDomainName"`
-	DNSServers     []string `json:"dnsServers,omitempty"`
-	IPPoolRanges   string   `json:"ipPoolRanges"`
+	NetworkUUID        string   `json:"networkUuid"`
+	Cluster            string   `json:"cluster"`
+	SubnetType         string   `json:"subnetType"`
+	VlanID             int      `json:"vlanId"`
+	AdvancedNetworking bool     `json:"advancedNetworking,omitempty"`
+	NetworkAddress     string   `json:"networkAddress"`
+	PrefixLength       int      `json:"prefixLength"`
+	DefaultGateway     string   `json:"defaultGateway"`
+	DHCPServerIP       string   `json:"dhcpServerIp"`
+	DHCPDomainName     string   `json:"dhcpDomainName"`
+	DNSServers         []string `json:"dnsServers,omitempty"`
+	IPPoolRanges       string   `json:"ipPoolRanges"`
 }
 
 // Build the resource using the model.
@@ -187,6 +188,7 @@ func (r *Network) With(m *model.Network) {
 	r.Cluster = m.Cluster
 	r.SubnetType = m.SubnetType
 	r.VlanID = m.VlanID
+	r.AdvancedNetworking = m.AdvancedNetworking
 	r.NetworkAddress = m.NetworkAddress
 	r.PrefixLength = m.PrefixLength
 	r.DefaultGateway = m.DefaultGateway

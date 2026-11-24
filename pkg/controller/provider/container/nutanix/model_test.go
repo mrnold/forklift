@@ -241,6 +241,61 @@ func TestApplyNetworkNameAndClusterNotFromWrongPaths(t *testing.T) {
 	}
 }
 
+func TestApplyNetworkAdvancedVLAN(t *testing.T) {
+	raw := []byte(`{
+		"metadata": {"uuid": "adv-1", "name": "meta"},
+		"spec": {
+			"name": "Advanced-VLAN-50",
+			"cluster_reference_list": [{"uuid": "cluster-a"}],
+			"resources": {
+				"vlan_id": 50,
+				"subnet_type": "VLAN",
+				"is_advanced_networking": true,
+				"ip_config": {
+					"subnet_ip": "10.50.0.0",
+					"prefix_length": 24,
+					"default_gateway_ip": "10.50.0.1",
+					"dhcp_options": {
+						"dhcp_server_address": {"ip": "10.50.0.2"},
+						"domain_name_server_list": ["10.50.0.10"]
+					}
+				}
+			}
+		},
+		"status": {
+			"name": "Advanced-VLAN-50",
+			"cluster_reference_list": [{"uuid": "cluster-a"}],
+			"resources": {}
+		}
+	}`)
+	var e networkEntity
+	if err := json.Unmarshal(raw, &e); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	m := &model.Network{}
+	e.ApplyTo(m)
+
+	if !m.AdvancedNetworking {
+		t.Error("expected AdvancedNetworking")
+	}
+	if m.Cluster != "cluster-a" {
+		t.Errorf("expected cluster-a from cluster_reference_list, got %q", m.Cluster)
+	}
+	if m.VlanID != 50 || m.SubnetType != "VLAN" {
+		t.Errorf("expected VLAN 50 from spec.resources, got type=%q vlan=%d", m.SubnetType, m.VlanID)
+	}
+	if m.DHCPServerIP != "10.50.0.2" {
+		t.Errorf("expected dhcp ip from object form, got %q", m.DHCPServerIP)
+	}
+	if m.DNSServers != "10.50.0.10" {
+		t.Errorf("expected DNS from spec, got %q", m.DNSServers)
+	}
+	if !e.belongsToCluster("cluster-a") || e.belongsToCluster("cluster-b") {
+		t.Error("belongsToCluster mismatch")
+	}
+}
+
 func TestApplyStorageContainer(t *testing.T) {
 	data, err := os.ReadFile("testdata/storage_containers_list.json")
 	if err != nil {

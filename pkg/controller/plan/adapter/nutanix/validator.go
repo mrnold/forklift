@@ -36,8 +36,29 @@ func (r *Validator) DirectStorage(_ ref.Ref) (bool, error) {
 	return true, nil
 }
 
-func (r *Validator) NetworksMapped(_ ref.Ref) (bool, error) {
-	// TODO: validate subnet mappings against VM NICs
+func (r *Validator) NetworksMapped(vmRef ref.Ref) (bool, error) {
+	vm := &model.VM{}
+	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+		return false, liberr.Wrap(err, "vm", vmRef.String())
+	}
+	if r.Map.Network == nil {
+		return false, nil
+	}
+	for _, nic := range vm.NICs {
+		if nic.SubnetUUID == "" {
+			continue
+		}
+		mapped := false
+		for _, pair := range r.Map.Network.Spec.Map {
+			if pair.Source.ID == nic.SubnetUUID {
+				mapped = true
+				break
+			}
+		}
+		if !mapped {
+			return false, nil
+		}
+	}
 	return true, nil
 }
 
@@ -45,9 +66,19 @@ func (r *Validator) MaintenanceMode(_ ref.Ref) (bool, error) {
 	return true, nil
 }
 
-func (r *Validator) NICNetworkRefs(_ ref.Ref) ([]ref.Ref, error) {
-	// TODO: return one ref per VM NIC subnet
-	return nil, nil
+func (r *Validator) NICNetworkRefs(vmRef ref.Ref) ([]ref.Ref, error) {
+	vm := &model.VM{}
+	if err := r.Source.Inventory.Find(vm, vmRef); err != nil {
+		return nil, liberr.Wrap(err, "vm", vmRef.String())
+	}
+	refs := make([]ref.Ref, 0, len(vm.NICs))
+	for _, nic := range vm.NICs {
+		if nic.SubnetUUID == "" {
+			continue
+		}
+		refs = append(refs, ref.Ref{ID: nic.SubnetUUID, Name: nic.SubnetName})
+	}
+	return refs, nil
 }
 
 func (r *Validator) StaticIPs(vmRef ref.Ref) (bool, error) {

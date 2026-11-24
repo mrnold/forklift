@@ -12,17 +12,18 @@ import (
 
 func TestNetwork_With(t *testing.T) {
 	m := &model.Network{
-		Base:           model.Base{ID: "net-1", Name: "Production-VLAN-100"},
-		NetworkUUID:    "net-1",
-		Cluster:        "cluster-1",
-		SubnetType:     "VLAN",
-		VlanID:         100,
-		NetworkAddress: "192.168.100.0",
-		PrefixLength:   24,
-		DefaultGateway: "192.168.100.1",
-		DHCPServerIP:   "192.168.100.2",
-		DHCPDomainName: "example.com",
-		IPPoolRanges:   "192.168.100.10-192.168.100.100",
+		Base:               model.Base{ID: "net-1", Name: "Production-VLAN-100"},
+		NetworkUUID:        "net-1",
+		Cluster:            "cluster-1",
+		SubnetType:         "VLAN",
+		VlanID:             100,
+		AdvancedNetworking: true,
+		NetworkAddress:     "192.168.100.0",
+		PrefixLength:       24,
+		DefaultGateway:     "192.168.100.1",
+		DHCPServerIP:       "192.168.100.2",
+		DHCPDomainName:     "example.com",
+		IPPoolRanges:       "192.168.100.10-192.168.100.100",
 	}
 
 	r := &Network{}
@@ -35,6 +36,7 @@ func TestNetwork_With(t *testing.T) {
 		r.Cluster != m.Cluster ||
 		r.SubnetType != m.SubnetType ||
 		r.VlanID != m.VlanID ||
+		r.AdvancedNetworking != m.AdvancedNetworking ||
 		r.NetworkAddress != m.NetworkAddress ||
 		r.PrefixLength != m.PrefixLength ||
 		r.DefaultGateway != m.DefaultGateway ||

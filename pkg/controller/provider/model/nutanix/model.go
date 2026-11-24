@@ -105,17 +105,18 @@ type Host struct {
 // Network represents a Nutanix subnet/network
 type Network struct {
 	Base
-	Cluster        string `sql:"d0,index(cluster)"`
-	NetworkUUID    string `sql:""`
-	VlanID         int    `sql:""`
-	SubnetType     string `sql:""`
-	NetworkAddress string `sql:""`
-	PrefixLength   int    `sql:""`
-	DefaultGateway string `sql:""`
-	DHCPServerIP   string `sql:""`
-	DHCPDomainName string `sql:""`
-	DNSServers     string `sql:""` // Comma-separated list
-	IPPoolRanges   string `sql:""` // Comma-separated list
+	Cluster               string `sql:"d0,index(cluster)"`
+	NetworkUUID           string `sql:""`
+	VlanID                int    `sql:""`
+	SubnetType            string `sql:""`
+	AdvancedNetworking    bool   `sql:""` // Network Controller / Advanced VLAN
+	NetworkAddress        string `sql:""`
+	PrefixLength          int    `sql:""`
+	DefaultGateway        string `sql:""`
+	DHCPServerIP          string `sql:""`
+	DHCPDomainName        string `sql:""`
+	DNSServers            string `sql:""` // Comma-separated list
+	IPPoolRanges          string `sql:""` // Comma-separated list
 }
 
 // StorageContainer represents a Nutanix storage container

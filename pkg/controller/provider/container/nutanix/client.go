@@ -173,12 +173,21 @@ func (r *Client) listVMs() (entities []vmEntity, err error) {
 }
 
 // List all subnets (networks), scoped to the configured clusterUuid (if any).
+// Matches both cluster_reference and cluster_reference_list so Network
+// Controller (Advanced VLAN) subnets are kept when the provider is PE-scoped.
 func (r *Client) listSubnets() (entities []networkEntity, err error) {
 	entities, err = listAllV3[networkEntity](r, "subnet", "", subnetPageSize)
 	if err != nil {
 		return nil, err
 	}
-	return filterByMatch(entities, r.prism.ClusterUUID, func(entity networkEntity) string {
-		return entity.clusterUUID()
-	}), nil
+	if r.prism.ClusterUUID == "" {
+		return entities, nil
+	}
+	filtered := make([]networkEntity, 0, len(entities))
+	for _, entity := range entities {
+		if entity.belongsToCluster(r.prism.ClusterUUID) {
+			filtered = append(filtered, entity)
+		}
+	}
+	return filtered, nil
 }

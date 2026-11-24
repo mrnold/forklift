@@ -1,6 +1,7 @@
 package nutanix
 
 import (
+	"encoding/json"
 	"strings"
 
 	model "github.com/kubev2v/forklift/pkg/controller/provider/model/nutanix"
@@ -154,21 +155,50 @@ func (e *hostEntity) ApplyTo(m *model.Host) {
 type networkEntity struct {
 	Metadata libclient.Metadata `json:"metadata"`
 	Spec     struct {
-		ClusterReference libclient.Ref `json:"cluster_reference"`
-		Name             string        `json:"name"`
+		ClusterReference     libclient.Ref    `json:"cluster_reference"`
+		ClusterReferenceList []libclient.Ref  `json:"cluster_reference_list"`
+		Name                 string           `json:"name"`
+		Resources            networkResources `json:"resources"`
 	} `json:"spec"`
 	Status struct {
-		ClusterReference libclient.Ref    `json:"cluster_reference"`
-		Name             string           `json:"name"`
-		Resources        networkResources `json:"resources"`
+		ClusterReference     libclient.Ref    `json:"cluster_reference"`
+		ClusterReferenceList []libclient.Ref  `json:"cluster_reference_list"`
+		Name                 string           `json:"name"`
+		Resources            networkResources `json:"resources"`
 	} `json:"status"`
+}
+
+// dhcpAddr accepts either a plain string or {"ip":"..."} from Prism.
+type dhcpAddr string
+
+func (d *dhcpAddr) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" || len(b) == 0 {
+		*d = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*d = dhcpAddr(s)
+		return nil
+	}
+	var obj struct {
+		IP string `json:"ip"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return err
+	}
+	*d = dhcpAddr(obj.IP)
+	return nil
 }
 
 type networkResources struct {
 	IPConfig struct {
 		DefaultGatewayIP string `json:"default_gateway_ip"`
 		DHCPOptions      struct {
-			DHCPServerAddress    string   `json:"dhcp_server_address"`
+			DHCPServerAddress    dhcpAddr `json:"dhcp_server_address"`
 			DomainName           string   `json:"domain_name"`
 			DomainNameServerList []string `json:"domain_name_server_list"`
 		} `json:"dhcp_options"`
@@ -178,16 +208,75 @@ type networkResources struct {
 		PrefixLength int    `json:"prefix_length"`
 		SubnetIP     string `json:"subnet_ip"`
 	} `json:"ip_config"`
-	SubnetType string `json:"subnet_type"`
-	VlanID     int    `json:"vlan_id"`
+	SubnetType           string `json:"subnet_type"`
+	VlanID               int    `json:"vlan_id"`
+	IsAdvancedNetworking bool   `json:"is_advanced_networking"`
 }
 
 func (e networkEntity) clusterUUID() string {
-	return clusterRef(e.Spec.ClusterReference.UUID, e.Status.ClusterReference.UUID)
+	if id := clusterRef(e.Spec.ClusterReference.UUID, e.Status.ClusterReference.UUID); id != "" {
+		return id
+	}
+	for _, ref := range append(e.Status.ClusterReferenceList, e.Spec.ClusterReferenceList...) {
+		if ref.UUID != "" {
+			return ref.UUID
+		}
+	}
+	return ""
+}
+
+func (e networkEntity) belongsToCluster(clusterUUID string) bool {
+	if clusterUUID == "" {
+		return true
+	}
+	if e.clusterUUID() == clusterUUID {
+		return true
+	}
+	for _, ref := range append(e.Status.ClusterReferenceList, e.Spec.ClusterReferenceList...) {
+		if ref.UUID == clusterUUID {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeNetworkResources(status, spec networkResources) networkResources {
+	out := status
+	if out.SubnetType == "" {
+		out.SubnetType = spec.SubnetType
+	}
+	if out.VlanID == 0 {
+		out.VlanID = spec.VlanID
+	}
+	if !out.IsAdvancedNetworking {
+		out.IsAdvancedNetworking = spec.IsAdvancedNetworking
+	}
+	if out.IPConfig.SubnetIP == "" {
+		out.IPConfig.SubnetIP = spec.IPConfig.SubnetIP
+	}
+	if out.IPConfig.PrefixLength == 0 {
+		out.IPConfig.PrefixLength = spec.IPConfig.PrefixLength
+	}
+	if out.IPConfig.DefaultGatewayIP == "" {
+		out.IPConfig.DefaultGatewayIP = spec.IPConfig.DefaultGatewayIP
+	}
+	if out.IPConfig.DHCPOptions.DHCPServerAddress == "" {
+		out.IPConfig.DHCPOptions.DHCPServerAddress = spec.IPConfig.DHCPOptions.DHCPServerAddress
+	}
+	if out.IPConfig.DHCPOptions.DomainName == "" {
+		out.IPConfig.DHCPOptions.DomainName = spec.IPConfig.DHCPOptions.DomainName
+	}
+	if len(out.IPConfig.DHCPOptions.DomainNameServerList) == 0 {
+		out.IPConfig.DHCPOptions.DomainNameServerList = spec.IPConfig.DHCPOptions.DomainNameServerList
+	}
+	if len(out.IPConfig.PoolList) == 0 {
+		out.IPConfig.PoolList = spec.IPConfig.PoolList
+	}
+	return out
 }
 
 func (e *networkEntity) ApplyTo(m *model.Network) {
-	resources := e.Status.Resources
+	resources := mergeNetworkResources(e.Status.Resources, e.Spec.Resources)
 	ipConfig := resources.IPConfig
 
 	m.ID = e.Metadata.UUID
@@ -196,10 +285,11 @@ func (e *networkEntity) ApplyTo(m *model.Network) {
 	m.Cluster = e.clusterUUID()
 	m.SubnetType = resources.SubnetType
 	m.VlanID = resources.VlanID
+	m.AdvancedNetworking = resources.IsAdvancedNetworking
 	m.NetworkAddress = ipConfig.SubnetIP
 	m.PrefixLength = ipConfig.PrefixLength
 	m.DefaultGateway = ipConfig.DefaultGatewayIP
-	m.DHCPServerIP = ipConfig.DHCPOptions.DHCPServerAddress
+	m.DHCPServerIP = string(ipConfig.DHCPOptions.DHCPServerAddress)
 	m.DHCPDomainName = ipConfig.DHCPOptions.DomainName
 	m.DNSServers = strings.Join(ipConfig.DHCPOptions.DomainNameServerList, ",")
 
